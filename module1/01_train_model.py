@@ -1,0 +1,436 @@
+import argparse
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
+import copy
+import random
+from pathlib import Path
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+BASE_SEED = 2025
+N_JOBS = -1
+
+
+def set_random_seed(seed):
+    """Reset every RNG used by one independently scheduled task."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+
+
+def make_task_seed(gene_index, fold_idx, shuffle_id=0):
+    """Create a stable unique seed from gene, fold and shuffle coordinates."""
+    if gene_index < 0 or fold_idx < 0 or shuffle_id < 0:
+        raise ValueError("Task coordinates must be non-negative")
+    if fold_idx >= 100 or shuffle_id >= 1000:
+        raise ValueError("fold_idx or shuffle_id exceeds the seed layout")
+    seed = BASE_SEED + gene_index * 100_000 + shuffle_id * 100 + fold_idx
+    if seed >= 2**32:
+        raise ValueError("Task seed exceeds NumPy's supported range")
+    return seed
+
+
+set_random_seed(BASE_SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+torch.set_num_threads(1)
+
+
+def ld_pruning(X, threshold=0.8):
+    if X.shape[1] == 0:
+        return X, np.array([])
+    
+    stds = X.std(axis=0)
+    non_zero_var_idx = np.where(stds > 0)[0]
+    if len(non_zero_var_idx) == 0:
+        return X[:, []], np.array([])
+    
+    X_clean = X[:, non_zero_var_idx]
+    if X_clean.shape[1] == 1:
+        return X_clean, non_zero_var_idx
+    
+    corr_matrix = np.corrcoef(X_clean, rowvar=False) ** 2
+    if corr_matrix.ndim != 2 or corr_matrix.shape[0] < 2:
+        return X_clean, non_zero_var_idx
+    
+    mask = np.triu(corr_matrix, k=1) > threshold
+    to_remove = set()
+    for i in range(mask.shape[0]):
+        for j in range(i + 1, mask.shape[1]):
+            if mask[i, j]:
+                to_remove.add(j)
+    
+    keep_idx = [i for i in range(X_clean.shape[1]) if i not in to_remove]
+    X_pruned = X_clean[:, keep_idx]
+    keep_idx_original = non_zero_var_idx[keep_idx]
+    return X_pruned, keep_idx_original
+
+
+class MLPFunction(nn.Module):
+    def __init__(self, input_dim=1, hidden_dim=8):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+    
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+class GenomicMLP(nn.Module):
+    def __init__(self, num_snps):
+        super().__init__()
+        self.snp_weights = nn.Parameter(torch.ones(num_snps) / num_snps)
+        self.mlp = MLPFunction(1)
+    
+    def forward(self, x):
+        weighted_sum = torch.matmul(x, self.snp_weights).unsqueeze(-1)
+        return self.mlp(weighted_sum)
+
+
+class MultiOmicsModel(nn.Module):
+    def __init__(self, num_snps, omics_dims):
+        super().__init__()
+        self.genomic = GenomicMLP(num_snps) if num_snps > 0 else None
+        self.omics_mlps = nn.ModuleList([MLPFunction(1) for _ in range(len(omics_dims))])
+        self.omics_dims = omics_dims
+        self.num_snps = num_snps
+    
+    def forward(self, snp, omics, m_params):
+        y = torch.zeros(snp.shape[0], device=snp.device, dtype=snp.dtype)
+        
+        if self.num_snps > 0 and m_params[0] > 0:
+            y = y + self.genomic(snp) * m_params[0]
+        
+        omics_start = 0
+        for k, dim in enumerate(self.omics_dims):
+            if dim > 0:
+                omics_k = omics[:, omics_start:omics_start + dim]
+                y = y + self.omics_mlps[k](omics_k) * m_params[k + 1]
+                omics_start += dim
+        return y.squeeze(-1)
+
+
+def fit(x_train, y_train, x_val, y_val, x_test, y_test, omics_dims, num_snps, test_idx):
+    if num_snps > 0:
+        snp_train = torch.tensor(x_train[:, :num_snps], dtype=torch.float32)
+        snp_val = torch.tensor(x_val[:, :num_snps], dtype=torch.float32)
+        snp_test = torch.tensor(x_test[:, :num_snps], dtype=torch.float32)
+        omics_train = torch.tensor(x_train[:, num_snps:], dtype=torch.float32)
+        omics_val = torch.tensor(x_val[:, num_snps:], dtype=torch.float32)
+        omics_test = torch.tensor(x_test[:, num_snps:], dtype=torch.float32)
+    else:
+        snp_train = torch.zeros((x_train.shape[0], 0), dtype=torch.float32)
+        snp_val = torch.zeros((x_val.shape[0], 0), dtype=torch.float32)
+        snp_test = torch.zeros((x_test.shape[0], 0), dtype=torch.float32)
+        omics_train = torch.tensor(x_train, dtype=torch.float32)
+        omics_val = torch.tensor(x_val, dtype=torch.float32)
+        omics_test = torch.tensor(x_test, dtype=torch.float32)
+    
+    y_train_torch = torch.tensor(y_train, dtype=torch.float32)
+    y_val_torch = torch.tensor(y_val, dtype=torch.float32)
+    y_test_torch = torch.tensor(y_test, dtype=torch.float32)
+    
+    outer_model = MultiOmicsModel(num_snps, omics_dims)
+    
+    best_val_r2 = -float('inf')
+    best_m = None
+    best_model_state = None
+    
+    valid_combinations = []
+    for i in range(16):
+        bits = [(i >> k) & 1 for k in range(4)]
+        valid = True
+        
+        if bits[0] == 1 and num_snps == 0:
+            valid = False
+        
+        for k in range(3):
+            if bits[k + 1] == 1 and omics_dims[k] == 0:
+                valid = False
+                break
+        
+        if sum(bits) == 0:
+            valid = False
+        
+        if valid:
+            valid_combinations.append(bits)
+    
+    for bits in valid_combinations:
+        m_params = torch.tensor(bits, dtype=torch.float32)
+        
+        inner_model = MultiOmicsModel(num_snps, omics_dims)
+        inner_model.load_state_dict(outer_model.state_dict())
+        
+        optimizer = optim.Adam(inner_model.parameters(), lr=1e-3, weight_decay=1e-4)
+        
+        best_fold_val_r2 = -float('inf')
+        best_fold_state = None
+        patience = 15
+        patience_counter = 0
+        
+        for epoch in range(300):
+            inner_model.train()
+            output = inner_model(snp_train, omics_train, m_params).squeeze()
+            loss = nn.MSELoss()(output, y_train_torch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            with torch.no_grad():
+                inner_model.eval()
+                val_output = inner_model(snp_val, omics_val, m_params).squeeze()
+                val_r2 = r2_score(y_val, val_output.numpy())
+                
+                if val_r2 > best_fold_val_r2:
+                    best_fold_val_r2 = val_r2
+                    best_fold_state = copy.deepcopy(inner_model.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+            
+            if patience_counter >= patience:
+                break
+        
+        outer_model.load_state_dict(best_fold_state)
+        
+        if best_fold_val_r2 > best_val_r2:
+            best_val_r2 = best_fold_val_r2
+            best_m = m_params.clone()
+            best_model_state = best_fold_state
+    
+    final_model = MultiOmicsModel(num_snps, omics_dims)
+    final_model.load_state_dict(best_model_state)
+    
+    with torch.no_grad():
+        final_model.eval()
+        y_pred = final_model(snp_test, omics_test, best_m)
+        r2 = r2_score(y_test, y_pred.numpy())
+        
+        contrib_snp = np.zeros(len(y_test))
+        contrib_rna = np.zeros(len(y_test))
+        contrib_ribo = np.zeros(len(y_test))
+        contrib_pro = np.zeros(len(y_test))
+        
+        if num_snps > 0 and best_m[0] > 0:
+            contrib_snp = (final_model.genomic(snp_test) * best_m[0]).numpy()
+        else:
+            contrib_snp = np.full(len(y_test), np.nan)
+        
+        omics_start = 0
+        for k, dim in enumerate(omics_dims):
+            if dim > 0:
+                omics_k = omics_test[:, omics_start:omics_start + dim]
+                contrib_value = (final_model.omics_mlps[k](omics_k) * best_m[k + 1]).numpy()
+                if k == 0:
+                    contrib_rna = contrib_value if best_m[1] > 0 else np.full(len(y_test), np.nan)
+                elif k == 1:
+                    contrib_ribo = contrib_value if best_m[2] > 0 else np.full(len(y_test), np.nan)
+                elif k == 2:
+                    contrib_pro = contrib_value if best_m[3] > 0 else np.full(len(y_test), np.nan)
+                omics_start += dim
+            else:
+                if k == 0:
+                    contrib_rna = np.full(len(y_test), np.nan)
+                elif k == 1:
+                    contrib_ribo = np.full(len(y_test), np.nan)
+                elif k == 2:
+                    contrib_pro = np.full(len(y_test), np.nan)
+    
+    output_m = best_m.numpy().copy()
+    if num_snps == 0:
+        output_m[0] = np.nan
+    for k in range(3):
+        if omics_dims[k] == 0:
+            output_m[k + 1] = np.nan
+    
+    return r2, output_m, test_idx, y_test, y_pred.numpy(), contrib_snp, contrib_rna, contrib_ribo, contrib_pro
+
+
+pheno = np.array([])
+snp_data = pd.DataFrame()
+rna_data = pd.DataFrame()
+ribo_data = pd.DataFrame()
+pro_data = pd.DataFrame()
+id_all_gene = []
+kf_splits = []
+
+
+def run_gene_fold(gene_index, id_genei, fold_idx):
+    task_seed = make_task_seed(gene_index, fold_idx, shuffle_id=0)
+    set_random_seed(task_seed)
+
+    gene_genei = None
+    snp_subset = snp_data[snp_data.iloc[:, 2] == id_genei]
+    if len(snp_subset) > 0:
+        gene_genei = np.array(snp_subset)[:, 9:].T.astype(np.int8)
+        gene_genei, _ = ld_pruning(gene_genei, threshold=0.8)
+    
+    rna_genei = None
+    ribo_genei = None
+    pro_genei = None
+    
+    if id_genei in rna_data.columns:
+        rna_genei = np.array(rna_data[id_genei].values.reshape(-1, 1))
+        rna_genei = StandardScaler().fit_transform(rna_genei)
+    
+    if id_genei in ribo_data.columns:
+        ribo_genei = np.array(ribo_data[id_genei].values.reshape(-1, 1))
+        ribo_genei = StandardScaler().fit_transform(ribo_genei)
+    
+    if id_genei in pro_data.columns:
+        pro_genei = np.array(pro_data[id_genei].values.reshape(-1, 1))
+        pro_genei = StandardScaler().fit_transform(pro_genei)
+    
+    if gene_genei is None and rna_genei is None and ribo_genei is None and pro_genei is None:
+        print(f"Warning: No data found for gene {id_genei}")
+        return None
+    
+    feat_list = []
+    omics_dims = []
+    num_snps = 0
+    
+    if gene_genei is not None:
+        feat_list.append(gene_genei)
+        num_snps = gene_genei.shape[1]
+    
+    if rna_genei is not None:
+        feat_list.append(rna_genei)
+        omics_dims.append(1)
+    else:
+        omics_dims.append(0)
+    
+    if ribo_genei is not None:
+        feat_list.append(ribo_genei)
+        omics_dims.append(1)
+    else:
+        omics_dims.append(0)
+    
+    if pro_genei is not None:
+        feat_list.append(pro_genei)
+        omics_dims.append(1)
+    else:
+        omics_dims.append(0)
+    
+    feat_all = np.concatenate(feat_list, axis=1)
+    y_scaled = StandardScaler().fit_transform(pheno.reshape(-1, 1)).ravel()
+    
+    train_val_idx, test_idx = kf_splits[fold_idx]
+    
+    X_train_val, X_test = feat_all[train_val_idx], feat_all[test_idx]
+    y_train_val, y_test = y_scaled[train_val_idx], y_scaled[test_idx]
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val, y_train_val, test_size=0.1, random_state=2025, shuffle=True
+    )
+    
+    r2, best_subnet, test_sample_idx, y_true, y_pred, contrib_snp, contrib_rna, contrib_ribo, contrib_pro = fit(
+        X_train, y_train, X_val, y_val, X_test, y_test, omics_dims, num_snps, test_idx
+    )
+    
+    summary_result = {
+        "gene_id": id_genei,
+        "fold": fold_idx + 1,
+        "r2": r2,
+        "subnet": best_subnet.tolist(),
+        "omics_dims": omics_dims,
+        "num_snps": num_snps,
+        "task_seed": task_seed
+    }
+    
+    contribution_results = []
+    for i, sample_idx in enumerate(test_sample_idx):
+        contribution_results.append({
+            "gene_id": id_genei,
+            "fold": fold_idx + 1,
+            "sample_idx": int(sample_idx),
+            "y_true": y_true[i],
+            "y_pred": y_pred[i],
+            "contrib_snp": contrib_snp[i],
+            "contrib_rna": contrib_rna[i],
+            "contrib_ribo": contrib_ribo[i],
+            "contrib_pro": contrib_pro[i]
+        })
+    
+    return summary_result, contribution_results
+
+
+def optional_omics(path):
+    return pd.read_csv(path) if path is not None else pd.DataFrame()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="MAD-FM Module 1: observed multi-omics bilevel analysis"
+    )
+    parser.add_argument("--phenotype", type=Path, required=True)
+    parser.add_argument("--genes", type=Path, required=True)
+    parser.add_argument("--genotype", type=Path)
+    parser.add_argument("--transcriptome", type=Path)
+    parser.add_argument("--translatome", type=Path)
+    parser.add_argument("--proteome", type=Path)
+    parser.add_argument("--phenotype-column", type=int, default=1)
+    parser.add_argument("--gene-column", type=int, default=0)
+    parser.add_argument("--folds", type=int, default=10)
+    parser.add_argument("--jobs", type=int, default=-1)
+    parser.add_argument("--output-dir", type=Path, default=Path("results/module1"))
+    return parser.parse_args()
+
+
+def main():
+    global pheno, snp_data, rna_data, ribo_data, pro_data
+    global id_all_gene, kf_splits, N_JOBS
+    args = parse_args()
+    if args.folds < 6:
+        raise ValueError("--folds must be at least 6 for downstream robust trimming")
+    pheno_table = pd.read_csv(args.phenotype)
+    pheno = pheno_table.iloc[:, args.phenotype_column].to_numpy()
+    snp_data = (
+        pd.read_csv(args.genotype)
+        if args.genotype is not None
+        else pd.DataFrame(columns=["chromosome", "position", "gene_id"])
+    )
+    rna_data = optional_omics(args.transcriptome)
+    ribo_data = optional_omics(args.translatome)
+    pro_data = optional_omics(args.proteome)
+    id_all_gene = (
+        pd.read_csv(args.genes).iloc[:, args.gene_column].dropna().astype(str).unique().tolist()
+    )
+    N_JOBS = args.jobs
+    kf = KFold(n_splits=args.folds, shuffle=True, random_state=1)
+    kf_splits = list(kf.split(range(len(pheno))))
+    all_tasks = [
+        (gene_index, gene_id, fold_idx)
+        for gene_index, gene_id in enumerate(id_all_gene)
+        for fold_idx in range(args.folds)
+    ]
+    all_results = Parallel(n_jobs=N_JOBS, verbose=1, backend="loky")(
+        delayed(run_gene_fold)(gene_index, gene_id, fold_idx)
+        for gene_index, gene_id, fold_idx in tqdm(all_tasks, desc="Gene-Folds")
+    )
+    all_results = [result for result in all_results if result is not None]
+    summary_results = [result[0] for result in all_results]
+    contribution_results = [row for result in all_results for row in result[1]]
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    observed_path = args.output_dir / "observed_results.csv"
+    contribution_path = args.output_dir / "omics_contributions.csv"
+    pd.DataFrame(summary_results).to_csv(observed_path, index=False)
+    pd.DataFrame(contribution_results).to_csv(contribution_path, index=False)
+    print(f"Observed results: {observed_path.resolve()}")
+    print(f"Omics contributions: {contribution_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
